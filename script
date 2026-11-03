@@ -455,6 +455,8 @@ local function textBoxFocused()
 end
 
 local wasDown = false
+local VK_UP, VK_DOWN = 0x26, 0x28
+local upWas, downWas = false, false
 task.spawn(function()
     while alive() do
         local active = isrbxactive()
@@ -482,6 +484,22 @@ task.spawn(function()
             UI.SetValue("cling_enabled", not UI.GetValue("cling_enabled"))
         end
         wasDown = down
+
+        -- Ctrl+Up / Ctrl+Down nudges the distance by 0.25
+        local ctrl = active and iskeypressed(VK_LCTRL)
+        local upNow = ctrl and iskeypressed(VK_UP)
+        local downNow = ctrl and iskeypressed(VK_DOWN)
+        if (upNow and not upWas) or (downNow and not downWas) then
+            local cur = UI.GetValue("cling_offset")
+            if isNum(cur) then
+                local new = cur + (upNow and 0.25 or -0.25)
+                if new < 0.2 then new = 0.2 end
+                if new > 6 then new = 6 end
+                UI.SetValue("cling_offset", new)
+                notify(string.format("Distance: %.2f", new), "Cling", 1)
+            end
+        end
+        upWas, downWas = upNow, downNow
         task.wait()
     end
 end)
