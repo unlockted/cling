@@ -1,16 +1,17 @@
--- Cling To Back v2.6 (Matcha) - cursor-targeted teleport + lock, chat-safe hotkey
+-- Cling To Back v3.0 (Matcha) - cursor-targeted teleport + lock, auto-calibrated facing
 -- Toggle: Left Ctrl + U (or the checkbox in the "Cling" tab)
 -- Unload: _G.__ClingSession = nil
 -- Re-running replaces any previous copy automatically.
 
 local SESSION = {}
-_G.__ClingSession = SESSION -- any older copy sees a different token and exits
+_G.__ClingSession = SESSION
 local function alive() return _G.__ClingSession == SESSION end
 
 local VK_U = 0x55
 local VK_ENTER, VK_ESC, VK_SLASH, VK_LCTRL = 0x0D, 0x1B, 0xBF, 0xA2
 
 local function isNum(x) return type(x) == "number" end
+local atan2 = math.atan2 or function(y, x) return math.atan(y, x) end
 
 ---------------------------------------------------------------------
 -- Robust Players / LocalPlayer lookup (never exits, re-resolves)
@@ -41,7 +42,7 @@ local function ensurePlayers()
             LP = lp
             return true
         end
-        Players, LP = nil, nil -- stale, re-resolve below
+        Players, LP = nil, nil
     end
     local svc = resolvePlayers()
     if svc then
@@ -83,6 +84,11 @@ local function dist3(a, b)
     if not (isNum(ax) and isNum(ay) and isNum(az) and isNum(bx) and isNum(by) and isNum(bz)) then return nil end
     local dx, dy, dz = ax - bx, ay - by, az - bz
     return math.sqrt(dx * dx + dy * dy + dz * dz)
+end
+
+local function rot(x, z, th)
+    local c, s = math.cos(th), math.sin(th)
+    return x * c - z * s, x * s + z * c
 end
 
 local function getChar(player)
@@ -133,17 +139,135 @@ local function pickUnderCursor(radius)
 end
 
 ---------------------------------------------------------------------
+-- Rotation tracking + auto-calibration
+---------------------------------------------------------------------
+-- Shared calibration: how far Matcha's raw LookVector is rotated from the
+-- direction a character actually walks. Learned from movement.
+local calib = { c = 0, s = 0, w = 0 }
+
+local function newTracker()
+    return { hist = {}, mx = nil, mz = nil, moving = false,
+             lastMx = nil, lastMz = nil, lx = nil, lz = nil }
+end
+
+local function updateTracker(tr, root, now)
+    local okP, pos = pcall(function() return root.Position end)
+    if not okP or not pos or not isNum(pos.X) or not isNum(pos.Z) then return false end
+
+    local h = tr.hist
+    h[#h + 1] = { t = now, x = pos.X, z = pos.Z }
+    while #h > 1 and (now - h[2].t) > 0.3 do table.remove(h, 1) end
+
+    local first = h[1]
+    local dx, dz = pos.X - first.x, pos.Z - first.z
+    local len = math.sqrt(dx * dx + dz * dz)
+    local age = now - first.t
+    tr.moving = false
+    if age > 0.1 and len > 0.6 and (len / age) > 4 then
+        tr.mx, tr.mz = dx / len, dz / len
+        tr.lastMx, tr.lastMz = tr.mx, tr.mz
+        tr.moving = true
+    end
+
+    tr.lx, tr.lz = nil, nil
+    local okL, lv = pcall(function() return root.CFrame.LookVector end)
+    if okL and lv and isNum(lv.X) and isNum(lv.Z) then
+        local l = math.sqrt(lv.X * lv.X + lv.Z * lv.Z)
+        if l > 0.05 then tr.lx, tr.lz = lv.X / l, lv.Z / l end
+    end
+
+    -- learn the rotation error while the character is walking
+    if tr.moving and tr.lx then
+        local dot = tr.lx * tr.mx + tr.lz * tr.mz
+        local cross = tr.lx * tr.mz - tr.lz * tr.mx
+        calib.c = calib.c * 0.998 + dot
+        calib.s = calib.s * 0.998 + cross
+        calib.w = calib.w * 0.998 + 1
+    end
+    return true
+end
+
+-- returns ok, theta(radians), confidence
+local function getCalib()
+    if calib.w < 25 then return false, 0, 0 end
+    local R = math.sqrt(calib.c * calib.c + calib.s * calib.s) / calib.w
+    if R < 0.7 then return false, 0, R end
+    local theta = atan2(calib.s, calib.c)
+    local snapped = math.floor(theta / (math.pi / 2) + 0.5) * (math.pi / 2)
+    if math.abs(theta - snapped) < math.rad(25) then theta = snapped end
+    return true, theta, R
+end
+
+local lastFx, lastFz = 0, -1
+
+-- Decide which way the target is facing. Returns fx, fz, sourceLabel
+local function resolveFacing(tr, mode)
+    local calibOK, theta = getCalib()
+    local fx, fz, src
+
+    if mode == 3 then
+        if tr.moving then fx, fz, src = tr.mx, tr.mz, "movement"
+        elseif tr.lastMx then fx, fz, src = tr.lastMx, tr.lastMz, "last movement" end
+    elseif mode == 2 then
+        if tr.lx then fx, fz, src = tr.lx, tr.lz, "raw look" end
+    else
+        if calibOK and tr.lx then
+            fx, fz = rot(tr.lx, tr.lz, theta)
+            src = "look+calib"
+        elseif tr.moving then
+            fx, fz, src = tr.mx, tr.mz, "movement"
+        elseif tr.lastMx then
+            fx, fz, src = tr.lastMx, tr.lastMz, "last movement"
+        elseif tr.lx then
+            fx, fz, src = tr.lx, tr.lz, "raw look (uncalibrated)"
+        end
+    end
+
+    if not fx then fx, fz, src = lastFx, lastFz, "held" end
+    lastFx, lastFz = fx, fz
+    return fx, fz, src
+end
+
+local function sourceMode(v)
+    if v == 2 or v == "Raw look direction" then return 2 end
+    if v == 3 or v == "Movement direction" then return 3 end
+    return 1
+end
+
+---------------------------------------------------------------------
+-- CFrame builder (position + facing), with fallbacks
+---------------------------------------------------------------------
+local warnedPosOnly = false
+local function buildCFrame(gx, gy, gz, fx, fz)
+    local pos = Vector3.new(gx, gy, gz)
+    local lookAt = Vector3.new(gx + fx, gy, gz + fz)
+    local ok, cf = pcall(function() return CFrame.new(pos, lookAt) end)
+    if ok and cf then return cf end
+    ok, cf = pcall(function() return CFrame.lookAt(pos, lookAt) end)
+    if ok and cf then return cf end
+    -- explicit yaw rotation matrix (row-major)
+    ok, cf = pcall(function() return CFrame.new(gx, gy, gz, -fz, 0, -fx, 0, 1, 0, fx, 0, -fz) end)
+    if ok and cf then return cf end
+    ok, cf = pcall(function() return CFrame.new(gx, gy, gz) end)
+    if ok and cf then
+        if not warnedPosOnly then
+            warnedPosOnly = true
+            warn("[Cling] orientation CFrame not supported, moving position only")
+        end
+        return cf
+    end
+    return nil
+end
+
+---------------------------------------------------------------------
 -- State
 ---------------------------------------------------------------------
 local locked = false
 local target = nil
 local saved = nil
 local writeChecks, writeFails = 0, 0
-
-local lastFx, lastFz = 0, -1
-local prevTx, prevTz = nil, nil
-local moveFx, moveFz = nil, nil
-local moveStamp = 0
+local tTracker = newTracker()
+local lpTracker = newTracker()
 local lastDebug = 0
 
 local function lockMovement(hum)
@@ -171,7 +295,8 @@ local function unlock(reason)
         restoreMovement()
         locked = false
         target = nil
-        prevTx, prevTz, moveFx, moveFz = nil, nil, nil, nil
+        tTracker = newTracker()
+        lpTracker = newTracker()
         if reason then notify(reason, "Cling", 2.5) end
     end
     if UI.GetValue("cling_enabled") then UI.SetValue("cling_enabled", false) end
@@ -185,12 +310,15 @@ UI.AddTab("Cling", function(tab)
     sec:Toggle("cling_enabled", "Enabled", false)
     sec:Text("Hotkey: Ctrl + U (aim cursor at a player first)")
     sec:Toggle("cling_ctrl", "Require Ctrl + U (prevents chat triggers)", true)
-    sec:Toggle("cling_face", "Face their back (look at target)", true)
     sec:SliderFloat("cling_offset", "Distance behind", 0.5, 6, 1.5, "%.1f")
     sec:SliderFloat("cling_height", "Height offset", -2, 4, 0, "%.1f")
-    sec:SliderInt("cling_angle", "Behind angle (deg)", -180, 180, 0)
-    sec:Tip("If you land on their side, try 90 or -90 until you're directly behind.")
-    sec:Combo("cling_source", "Facing source", {"Look direction", "Movement direction"}, 1)
+    sec:Combo("cling_source", "Facing source", {"Auto (calibrated)", "Raw look direction", "Movement direction"}, 1)
+    sec:SliderInt("cling_angle", "Facing correction (deg)", -180, 180, 0)
+    sec:Tip("Only if you're still off: try 90, -90 or 180. Applies to both your position and your facing.")
+    sec:Button("Reset rotation calibration", function()
+        calib.c, calib.s, calib.w = 0, 0, 0
+        notify("Calibration reset. Walk around to relearn.", "Cling", 2)
+    end)
     sec:SliderInt("cling_radius", "Cursor pick radius (px)", 50, 600, 250)
     sec:Toggle("cling_debug", "Debug print (console)", false)
 end)
@@ -242,35 +370,6 @@ task.spawn(function()
 end)
 
 ---------------------------------------------------------------------
--- Facing
----------------------------------------------------------------------
-local function getFacing(tRoot, useMovement)
-    local pos = tRoot.Position
-    local tx, tz = pos.X, pos.Z
-
-    if isNum(tx) and isNum(tz) and prevTx then
-        local dx, dz = tx - prevTx, tz - prevTz
-        local len = math.sqrt(dx * dx + dz * dz)
-        if len > 0.06 then
-            moveFx, moveFz = dx / len, dz / len
-            moveStamp = tick()
-        end
-    end
-    prevTx, prevTz = tx, tz
-
-    local okL, lv = pcall(function() return tRoot.CFrame.LookVector end)
-    if okL and lv and isNum(lv.X) and isNum(lv.Z) then
-        local len = math.sqrt(lv.X * lv.X + lv.Z * lv.Z)
-        if len > 0.05 then lastFx, lastFz = lv.X / len, lv.Z / len end
-    end
-
-    if useMovement and moveFx and (tick() - moveStamp) < 0.4 then
-        return moveFx, moveFz
-    end
-    return lastFx, lastFz
-end
-
----------------------------------------------------------------------
 -- Main loop (every frame)
 ---------------------------------------------------------------------
 task.spawn(function()
@@ -280,6 +379,7 @@ task.spawn(function()
             reportWaiting()
             task.wait(0.5)
         else
+            local now = tick()
             local enabled = UI.GetValue("cling_enabled")
 
             if enabled and not locked then
@@ -295,7 +395,7 @@ task.spawn(function()
                         target = p
                         locked = true
                         writeChecks, writeFails = 0, 0
-                        prevTx, prevTz, moveFx, moveFz = nil, nil, nil, nil
+                        tTracker = newTracker()
                         lockMovement(myHum)
                         notify("Clinging to " .. p.Name, "Cling", 2)
                     end
@@ -314,41 +414,25 @@ task.spawn(function()
                 else
                     local back = UI.GetValue("cling_offset")
                     local up = UI.GetValue("cling_height")
-                    local angle = UI.GetValue("cling_angle")
-                    local src = UI.GetValue("cling_source")
+                    local corr = UI.GetValue("cling_angle")
                     if not isNum(back) then back = 1.5 end
                     if not isNum(up) then up = 0 end
-                    if not isNum(angle) then angle = 0 end
-                    local useMovement = (src == 2 or src == "Movement direction")
-                    local faceTarget = UI.GetValue("cling_face")
-                    if faceTarget == nil then faceTarget = true end
+                    if not isNum(corr) then corr = 0 end
+                    local mode = sourceMode(UI.GetValue("cling_source"))
 
+                    local okT = updateTracker(tTracker, tRoot, now)
                     local okP, tPos = pcall(function() return tRoot.Position end)
-                    if okP and tPos and isNum(tPos.X) then
-                        local fx, fz = getFacing(tRoot, useMovement)
+                    if okT and okP and tPos and isNum(tPos.X) then
+                        local fx, fz, src = resolveFacing(tTracker, mode)
+                        if corr ~= 0 then fx, fz = rot(fx, fz, math.rad(corr)) end
 
-                        local bx, bz = -fx, -fz
-                        local rad = math.rad(angle)
-                        local c, s = math.cos(rad), math.sin(rad)
-                        local rx = bx * c - bz * s
-                        local rz = bx * s + bz * c
-
-                        local gx = tPos.X + rx * back
+                        -- directly behind them, facing the same way (my front -> their back)
+                        local gx = tPos.X - fx * back
                         local gy = tPos.Y + up
-                        local gz = tPos.Z + rz * back
-                        local goalPos = Vector3.new(gx, gy, gz)
+                        local gz = tPos.Z - fz * back
 
-                        local okC, goal = pcall(function()
-                            if faceTarget then
-                                return CFrame.new(goalPos, Vector3.new(tPos.X, gy, tPos.Z))
-                            end
-                            return CFrame.new(goalPos, Vector3.new(gx + fx, gy, gz + fz))
-                        end)
-                        if not okC or not goal then
-                            okC, goal = pcall(function() return CFrame.new(gx, gy, gz) end)
-                        end
-
-                        if okC and goal then
+                        local goal = buildCFrame(gx, gy, gz, fx, fz)
+                        if goal then
                             local ok, err = pcall(function() myRoot.CFrame = goal end)
                             if not ok then
                                 warn("[Cling] CFrame write failed: " .. tostring(err))
@@ -357,7 +441,7 @@ task.spawn(function()
                                 writeChecks = writeChecks + 1
                                 local rok, cur = pcall(function() return myRoot.Position end)
                                 if rok and cur then
-                                    local d = dist3(cur, goalPos)
+                                    local d = dist3(cur, Vector3.new(gx, gy, gz))
                                     if d and d > 8 then writeFails = writeFails + 1 end
                                 end
                                 if writeChecks == 8 and writeFails == 8 then
@@ -368,13 +452,18 @@ task.spawn(function()
                             warn("[Cling] could not build goal CFrame")
                         end
 
-                        if UI.GetValue("cling_debug") and (tick() - lastDebug) > 1 then
-                            lastDebug = tick()
-                            print(string.format("[Cling] facing=(%.2f, %.2f) angle=%d src=%s",
-                                fx, fz, angle, tostring(src)))
+                        if UI.GetValue("cling_debug") and (now - lastDebug) > 1 then
+                            lastDebug = now
+                            local cok, th, R = getCalib()
+                            print(string.format("[Cling] src=%s face=(%.2f,%.2f) calibOK=%s theta=%d conf=%.2f samples=%.0f moving=%s",
+                                src, fx, fz, tostring(cok), math.floor(math.deg(th) + 0.5), R, calib.w, tostring(tTracker.moving)))
                         end
                     end
                 end
+            else
+                -- idle: learn the rotation error from your own walking
+                local myRoot = getChar(LP)
+                if myRoot then updateTracker(lpTracker, myRoot, now) else lpTracker = newTracker() end
             end
 
             task.wait()
@@ -383,4 +472,4 @@ task.spawn(function()
     restoreMovement()
 end)
 
-notify("Cling v2.6 loaded. Aim at a player, press Ctrl+U.", "Cling", 3)
+notify("Cling v3.0 loaded. Walk around a bit, aim at a player, press Ctrl+U.", "Cling", 4)
