@@ -1,16 +1,47 @@
--- Cling To Back v2.3 (Matcha) - cursor-targeted teleport + lock, chat-safe hotkey
+-- Cling To Back v2.4 (Matcha) - cursor-targeted teleport + lock, chat-safe hotkey
 -- Toggle: Left Ctrl + U (or the checkbox in the "Cling" tab)
 
 _G.__ClingLoaded = nil
-if _G.__Cling2 then
+_G.__Cling2 = nil -- stops/clears any older version
+if _G.__Cling3 then
     notify("Cling is already running", "Cling", 3)
     return
 end
-_G.__Cling2 = true
 
-local Players = game:GetService("Players")
-local UserInputService = game:GetService("UserInputService")
-local LP = Players.LocalPlayer
+local function getService(name)
+    local ok, svc = pcall(function() return game:GetService(name) end)
+    if ok and svc then return svc end
+    ok, svc = pcall(function() return game[name] end)
+    if ok and svc then return svc end
+    return nil
+end
+
+-- Wait for the game to be ready (up to ~10 seconds)
+local Players
+for _ = 1, 100 do
+    Players = getService("Players")
+    if Players then break end
+    task.wait(0.1)
+end
+if not Players then
+    notify("Players service not available yet. Rejoin and re-run.", "Cling", 4)
+    return
+end
+
+local LP
+for _ = 1, 100 do
+    LP = Players.LocalPlayer
+    if LP then break end
+    task.wait(0.1)
+end
+if not LP then
+    notify("LocalPlayer not available yet. Re-run in a moment.", "Cling", 4)
+    return
+end
+
+local UserInputService = getService("UserInputService") -- may be nil; all uses are pcall-guarded
+_G.__Cling3 = true
+
 local VK_U = 0x55
 
 local function isNum(x) return type(x) == "number" end
@@ -78,9 +109,9 @@ local writeChecks = 0
 local writeFails = 0
 
 -- Facing tracking state
-local lastFx, lastFz = 0, -1       -- last valid flat look direction
-local prevTx, prevTz = nil, nil    -- previous target position (for movement dir)
-local moveFx, moveFz = nil, nil    -- last movement direction
+local lastFx, lastFz = 0, -1
+local prevTx, prevTz = nil, nil
+local moveFx, moveFz = nil, nil
 local moveStamp = 0
 local lastDebug = 0
 
@@ -143,7 +174,7 @@ end
 
 local wasDown = false
 task.spawn(function()
-    while _G.__Cling2 do
+    while _G.__Cling3 do
         local active = isrbxactive()
 
         local enter = active and iskeypressed(VK_ENTER)
@@ -178,7 +209,6 @@ local function getFacing(tRoot, useMovement)
     local pos = tRoot.Position
     local tx, tz = pos.X, pos.Z
 
-    -- track movement direction
     if isNum(tx) and isNum(tz) and prevTx then
         local dx, dz = tx - prevTx, tz - prevTz
         local len = math.sqrt(dx * dx + dz * dz)
@@ -189,7 +219,6 @@ local function getFacing(tRoot, useMovement)
     end
     prevTx, prevTz = tx, tz
 
-    -- look direction
     local okL, lv = pcall(function() return tRoot.CFrame.LookVector end)
     if okL and lv and isNum(lv.X) and isNum(lv.Z) then
         local len = math.sqrt(lv.X * lv.X + lv.Z * lv.Z)
@@ -204,7 +233,7 @@ end
 
 -- Main loop
 task.spawn(function()
-    while _G.__Cling2 do
+    while _G.__Cling3 do
         local enabled = UI.GetValue("cling_enabled")
 
         if enabled and not locked then
@@ -250,7 +279,6 @@ task.spawn(function()
                 if okP and tPos and isNum(tPos.X) then
                     local fx, fz = getFacing(tRoot, useMovement)
 
-                    -- "behind" = opposite of facing, then rotated by the angle offset
                     local bx, bz = -fx, -fz
                     local rad = math.rad(angle)
                     local c, s = math.cos(rad), math.sin(rad)
@@ -262,7 +290,6 @@ task.spawn(function()
                     local gz = tPos.Z + rz * back
                     local goalPos = Vector3.new(gx, gy, gz)
 
-                    -- face the same way the target faces; fall back to position only
                     local okC, goal = pcall(function()
                         return CFrame.new(goalPos, Vector3.new(gx + fx, gy, gz + fz))
                     end)
@@ -304,4 +331,4 @@ task.spawn(function()
     restoreMovement()
 end)
 
-notify("Cling v2.3 loaded. Aim at a player, press Ctrl+U.", "Cling", 3)
+notify("Cling v2.4 loaded. Aim at a player, press Ctrl+U.", "Cling", 3)
