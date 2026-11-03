@@ -1,0 +1,307 @@
+-- Cling To Back v2.3 (Matcha) - cursor-targeted teleport + lock, chat-safe hotkey
+-- Toggle: Left Ctrl + U (or the checkbox in the "Cling" tab)
+
+_G.__ClingLoaded = nil
+if _G.__Cling2 then
+    notify("Cling is already running", "Cling", 3)
+    return
+end
+_G.__Cling2 = true
+
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local LP = Players.LocalPlayer
+local VK_U = 0x55
+
+local function isNum(x) return type(x) == "number" end
+
+local function dist2(ax, ay, bx, by)
+    if not (isNum(ax) and isNum(ay) and isNum(bx) and isNum(by)) then return nil end
+    local dx, dy = ax - bx, ay - by
+    return math.sqrt(dx * dx + dy * dy)
+end
+
+local function dist3(a, b)
+    local ax, ay, az, bx, by, bz = a.X, a.Y, a.Z, b.X, b.Y, b.Z
+    if not (isNum(ax) and isNum(ay) and isNum(az) and isNum(bx) and isNum(by) and isNum(bz)) then return nil end
+    local dx, dy, dz = ax - bx, ay - by, az - bz
+    return math.sqrt(dx * dx + dy * dy + dz * dz)
+end
+
+local function getChar(player)
+    local char = player and player.Character
+    if not char then return nil end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    local hum = char:FindFirstChild("Humanoid")
+    if not hrp or not hum then return nil end
+    local okH, health = pcall(function() return hum.Health end)
+    if okH and isNum(health) and health <= 0 then return nil end
+    return hrp, hum
+end
+
+local function getCursor()
+    local ok, pos = pcall(function() return UserInputService:GetMouseLocation() end)
+    if ok and pos and isNum(pos.X) and isNum(pos.Y) then return pos.X, pos.Y, true end
+    local cam = workspace.CurrentCamera
+    local ok2, vp = pcall(function() return cam.ViewportSize end)
+    if ok2 and vp and isNum(vp.X) and isNum(vp.Y) then return vp.X / 2, vp.Y / 2, false end
+    return 960, 540, false
+end
+
+local function pickUnderCursor(radius)
+    radius = isNum(radius) and radius or 250
+    local cx, cy = getCursor()
+    local best, bestDist = nil, radius
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LP then
+            local root = getChar(p)
+            if root then
+                local okP, pos = pcall(function() return root.Position end)
+                if okP and pos then
+                    local screenPos, onScreen = WorldToScreen(pos)
+                    if onScreen and screenPos then
+                        local d = dist2(screenPos.X, screenPos.Y, cx, cy)
+                        if d and d < bestDist then best, bestDist = p, d end
+                    end
+                end
+            end
+        end
+    end
+    return best
+end
+
+-- Movement lock state
+local locked = false
+local target = nil
+local saved = nil
+local writeChecks = 0
+local writeFails = 0
+
+-- Facing tracking state
+local lastFx, lastFz = 0, -1       -- last valid flat look direction
+local prevTx, prevTz = nil, nil    -- previous target position (for movement dir)
+local moveFx, moveFz = nil, nil    -- last movement direction
+local moveStamp = 0
+local lastDebug = 0
+
+local function lockMovement(hum)
+    saved = { hum = hum, ws = nil, jp = nil, jh = nil }
+    pcall(function() saved.ws = hum.WalkSpeed end)
+    pcall(function() saved.jp = hum.JumpPower end)
+    pcall(function() saved.jh = hum.JumpHeight end)
+    local ok = pcall(function() hum.WalkSpeed = 0 end)
+    if not ok then warn("[Cling] could not set WalkSpeed") end
+    pcall(function() hum.JumpPower = 0 end)
+    pcall(function() hum.JumpHeight = 0 end)
+end
+
+local function restoreMovement()
+    if not saved then return end
+    local h = saved.hum
+    if saved.ws then pcall(function() h.WalkSpeed = saved.ws end) end
+    if saved.jp then pcall(function() h.JumpPower = saved.jp end) end
+    if saved.jh then pcall(function() h.JumpHeight = saved.jh end) end
+    saved = nil
+end
+
+local function unlock(reason)
+    if locked then
+        restoreMovement()
+        locked = false
+        target = nil
+        prevTx, prevTz, moveFx, moveFz = nil, nil, nil, nil
+        if reason then notify(reason, "Cling", 2.5) end
+    end
+    if UI.GetValue("cling_enabled") then UI.SetValue("cling_enabled", false) end
+end
+
+-- UI
+UI.AddTab("Cling", function(tab)
+    local sec = tab:Section("Cling To Back", "Left")
+    sec:Toggle("cling_enabled", "Enabled", false)
+    sec:Text("Hotkey: Ctrl + U (aim cursor at a player first)")
+    sec:Toggle("cling_ctrl", "Require Ctrl + U (prevents chat triggers)", true)
+    sec:SliderFloat("cling_offset", "Distance behind", 0.5, 6, 1.5, "%.1f")
+    sec:SliderFloat("cling_height", "Height offset", -2, 4, 0, "%.1f")
+    sec:SliderInt("cling_angle", "Behind angle (deg)", -180, 180, 0)
+    sec:Tip("If you land on their side, try 90 or -90 until you're directly behind.")
+    sec:Combo("cling_source", "Facing source", {"Look direction", "Movement direction"}, 1)
+    sec:SliderInt("cling_radius", "Cursor pick radius (px)", 50, 600, 250)
+    sec:Toggle("cling_debug", "Debug print (console)", false)
+end)
+
+-- Hotkey (edge-detected, chat-safe)
+local VK_ENTER, VK_ESC, VK_SLASH, VK_LCTRL = 0x0D, 0x1B, 0xBF, 0xA2
+local chatOpen = false
+local enterWas, escWas, slashWas = false, false, false
+
+local function textBoxFocused()
+    local ok, box = pcall(function() return UserInputService:GetFocusedTextBox() end)
+    if ok then return box ~= nil, true end
+    return false, false
+end
+
+local wasDown = false
+task.spawn(function()
+    while _G.__Cling2 do
+        local active = isrbxactive()
+
+        local enter = active and iskeypressed(VK_ENTER)
+        local esc = active and iskeypressed(VK_ESC)
+        local slash = active and iskeypressed(VK_SLASH)
+        if slash and not slashWas and not chatOpen then
+            chatOpen = true
+        elseif enter and not enterWas then
+            chatOpen = not chatOpen
+        end
+        if esc and not escWas then chatOpen = false end
+        enterWas, escWas, slashWas = enter, esc, slash
+
+        local focused, supported = textBoxFocused()
+        local typing = (supported and focused) or (not supported and chatOpen)
+
+        local down = active and iskeypressed(VK_U)
+        if UI.GetValue("cling_ctrl") then
+            down = down and iskeypressed(VK_LCTRL)
+        end
+
+        if down and not wasDown and not typing then
+            UI.SetValue("cling_enabled", not UI.GetValue("cling_enabled"))
+        end
+        wasDown = down
+        task.wait(0.05)
+    end
+end)
+
+-- Work out the flat direction the target is facing
+local function getFacing(tRoot, useMovement)
+    local pos = tRoot.Position
+    local tx, tz = pos.X, pos.Z
+
+    -- track movement direction
+    if isNum(tx) and isNum(tz) and prevTx then
+        local dx, dz = tx - prevTx, tz - prevTz
+        local len = math.sqrt(dx * dx + dz * dz)
+        if len > 0.06 then
+            moveFx, moveFz = dx / len, dz / len
+            moveStamp = tick()
+        end
+    end
+    prevTx, prevTz = tx, tz
+
+    -- look direction
+    local okL, lv = pcall(function() return tRoot.CFrame.LookVector end)
+    if okL and lv and isNum(lv.X) and isNum(lv.Z) then
+        local len = math.sqrt(lv.X * lv.X + lv.Z * lv.Z)
+        if len > 0.05 then lastFx, lastFz = lv.X / len, lv.Z / len end
+    end
+
+    if useMovement and moveFx and (tick() - moveStamp) < 0.4 then
+        return moveFx, moveFz
+    end
+    return lastFx, lastFz
+end
+
+-- Main loop
+task.spawn(function()
+    while _G.__Cling2 do
+        local enabled = UI.GetValue("cling_enabled")
+
+        if enabled and not locked then
+            local myRoot, myHum = getChar(LP)
+            if not myRoot then
+                unlock("Your character isn't ready")
+            else
+                local _, _, hasMouse = getCursor()
+                local p = pickUnderCursor(UI.GetValue("cling_radius"))
+                if not p then
+                    unlock(hasMouse and "No player under cursor" or "No player near screen center (cursor read unavailable)")
+                else
+                    target = p
+                    locked = true
+                    writeChecks, writeFails = 0, 0
+                    prevTx, prevTz, moveFx, moveFz = nil, nil, nil, nil
+                    lockMovement(myHum)
+                    notify("Clinging to " .. p.Name, "Cling", 2)
+                end
+            end
+        elseif not enabled and locked then
+            unlock("Cling off")
+        end
+
+        if locked then
+            local myRoot = getChar(LP)
+            local tRoot = getChar(target)
+            if not myRoot then
+                unlock("Your character is gone, cling stopped")
+            elseif not tRoot then
+                unlock("Target died or left, cling stopped")
+            else
+                local back = UI.GetValue("cling_offset")
+                local up = UI.GetValue("cling_height")
+                local angle = UI.GetValue("cling_angle")
+                local src = UI.GetValue("cling_source")
+                if not isNum(back) then back = 1.5 end
+                if not isNum(up) then up = 0 end
+                if not isNum(angle) then angle = 0 end
+                local useMovement = (src == 2 or src == "Movement direction")
+
+                local okP, tPos = pcall(function() return tRoot.Position end)
+                if okP and tPos and isNum(tPos.X) then
+                    local fx, fz = getFacing(tRoot, useMovement)
+
+                    -- "behind" = opposite of facing, then rotated by the angle offset
+                    local bx, bz = -fx, -fz
+                    local rad = math.rad(angle)
+                    local c, s = math.cos(rad), math.sin(rad)
+                    local rx = bx * c - bz * s
+                    local rz = bx * s + bz * c
+
+                    local gx = tPos.X + rx * back
+                    local gy = tPos.Y + up
+                    local gz = tPos.Z + rz * back
+                    local goalPos = Vector3.new(gx, gy, gz)
+
+                    -- face the same way the target faces; fall back to position only
+                    local okC, goal = pcall(function()
+                        return CFrame.new(goalPos, Vector3.new(gx + fx, gy, gz + fz))
+                    end)
+                    if not okC or not goal then
+                        okC, goal = pcall(function() return CFrame.new(gx, gy, gz) end)
+                    end
+
+                    if okC and goal then
+                        local ok, err = pcall(function() myRoot.CFrame = goal end)
+                        if not ok then
+                            warn("[Cling] CFrame write failed: " .. tostring(err))
+                            unlock("CFrame writes aren't supported here, see console")
+                        elseif writeChecks < 8 then
+                            writeChecks = writeChecks + 1
+                            local rok, cur = pcall(function() return myRoot.Position end)
+                            if rok and cur then
+                                local d = dist3(cur, goalPos)
+                                if d and d > 8 then writeFails = writeFails + 1 end
+                            end
+                            if writeChecks == 8 and writeFails == 8 then
+                                unlock("Write had no effect (position unchanged). Needs memory offsets.")
+                            end
+                        end
+                    else
+                        warn("[Cling] could not build goal CFrame")
+                    end
+
+                    if UI.GetValue("cling_debug") and (tick() - lastDebug) > 1 then
+                        lastDebug = tick()
+                        print(string.format("[Cling] facing=(%.2f, %.2f) angle=%d src=%s",
+                            fx, fz, angle, tostring(src)))
+                    end
+                end
+            end
+        end
+
+        task.wait()
+    end
+    restoreMovement()
+end)
+
+notify("Cling v2.3 loaded. Aim at a player, press Ctrl+U.", "Cling", 3)
