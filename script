@@ -1,4 +1,4 @@
--- Cling To Back v3.1 (Matcha) - cursor-targeted teleport + lock, auto-calibrated facing
+-- Cling To Back v3.2 (Matcha) - closer + low-latency follow
 -- Toggle: Left Ctrl + U (or the checkbox in the "Cling" tab)
 -- Unload: _G.__ClingSession = nil
 -- Re-running replaces any previous copy automatically.
@@ -14,11 +14,11 @@ local function isNum(x) return type(x) == "number" end
 local atan2 = math.atan2 or function(y, x) return math.atan(y, x) end
 
 ---------------------------------------------------------------------
--- Robust Players / LocalPlayer lookup (cached, with grace period)
+-- Players / LocalPlayer lookup (cached, with grace period)
 ---------------------------------------------------------------------
 local Players, LP
 local lastGood = 0
-local GRACE = 10 -- seconds to keep using cached refs when lookups fail
+local GRACE = 10
 
 local lookups = {
     function() return game:GetService("Players") end,
@@ -38,7 +38,6 @@ local function resolvePlayers()
 end
 
 local function ensurePlayers()
-    -- 1) cached refs still readable? great, nothing else to do
     if Players and LP then
         local ok, name = pcall(function() return LP.Name end)
         if ok and name then
@@ -46,8 +45,6 @@ local function ensurePlayers()
             return true
         end
     end
-
-    -- 2) try to re-resolve
     local svc = resolvePlayers()
     if svc then
         local ok, lp = pcall(function() return svc.LocalPlayer end)
@@ -57,8 +54,6 @@ local function ensurePlayers()
             return true
         end
     end
-
-    -- 3) grace period: keep using the last good refs for a while
     if Players and LP and (tick() - lastGood) < GRACE then
         return true
     end
@@ -161,49 +156,72 @@ local function pickUnderCursor(radius)
 end
 
 ---------------------------------------------------------------------
+-- Settings cache (refreshed ~30x/sec so the fast path never touches UI)
+---------------------------------------------------------------------
+local S = { back = 1.0, up = 0, corr = 0, mode = 1, leadMs = 40, usePing = false, ping = 0 }
+
+local function sourceMode(v)
+    if v == 2 or v == "Raw look direction" then return 2 end
+    if v == 3 or v == "Movement direction" then return 3 end
+    return 1
+end
+
+local function refreshSettings()
+    local v = UI.GetValue("cling_offset"); if isNum(v) then S.back = v end
+    v = UI.GetValue("cling_height"); if isNum(v) then S.up = v end
+    v = UI.GetValue("cling_angle"); if isNum(v) then S.corr = v end
+    v = UI.GetValue("cling_lead"); if isNum(v) then S.leadMs = v end
+    S.usePing = UI.GetValue("cling_ping") == true
+    S.mode = sourceMode(UI.GetValue("cling_source"))
+    if S.usePing then
+        local ok, p = pcall(GetPingValue)
+        if ok and isNum(p) then S.ping = p end
+    end
+end
+
+---------------------------------------------------------------------
 -- Rotation tracking + auto-calibration
 ---------------------------------------------------------------------
 local calib = { c = 0, s = 0, w = 0 }
+local WINDOW = 0.15
 
 local function newTracker()
-    return { hist = {}, mx = nil, mz = nil, moving = false,
-             lastMx = nil, lastMz = nil, lx = nil, lz = nil }
+    return { hist = {}, mx = nil, mz = nil, moving = false, lastMx = nil, lastMz = nil,
+             lx = nil, lz = nil, vx = 0, vz = 0, speed = 0 }
 end
 
-local function updateTracker(tr, root, now)
-    local okP, pos = pcall(function() return root.Position end)
-    if not okP or not pos or not isNum(pos.X) or not isNum(pos.Z) then return false end
-
+local function updateTracker(tr, px, pz, lx, lz, now)
     local h = tr.hist
-    h[#h + 1] = { t = now, x = pos.X, z = pos.Z }
-    while #h > 1 and (now - h[2].t) > 0.3 do table.remove(h, 1) end
+    h[#h + 1] = { t = now, x = px, z = pz }
+    while #h > 1 and (now - h[2].t) > WINDOW do table.remove(h, 1) end
 
     local first = h[1]
-    local dx, dz = pos.X - first.x, pos.Z - first.z
+    local dx, dz = px - first.x, pz - first.z
     local len = math.sqrt(dx * dx + dz * dz)
     local age = now - first.t
+
     tr.moving = false
-    if age > 0.1 and len > 0.6 and (len / age) > 4 then
+    tr.vx, tr.vz, tr.speed = 0, 0, 0
+    if age > 0.05 then
+        tr.vx, tr.vz = dx / age, dz / age
+        tr.speed = len / age
+    end
+    if age > 0.1 and len > 0.6 and tr.speed > 4 then
         tr.mx, tr.mz = dx / len, dz / len
         tr.lastMx, tr.lastMz = tr.mx, tr.mz
         tr.moving = true
     end
 
-    tr.lx, tr.lz = nil, nil
-    local okL, lv = pcall(function() return root.CFrame.LookVector end)
-    if okL and lv and isNum(lv.X) and isNum(lv.Z) then
-        local l = math.sqrt(lv.X * lv.X + lv.Z * lv.Z)
-        if l > 0.05 then tr.lx, tr.lz = lv.X / l, lv.Z / l end
-    end
+    tr.lx, tr.lz = lx, lz
 
-    if tr.moving and tr.lx then
-        local dot = tr.lx * tr.mx + tr.lz * tr.mz
-        local cross = tr.lx * tr.mz - tr.lz * tr.mx
+    -- learn the rotation error while the character is walking
+    if tr.moving and lx then
+        local dot = lx * tr.mx + lz * tr.mz
+        local cross = lx * tr.mz - lz * tr.mx
         calib.c = calib.c * 0.998 + dot
         calib.s = calib.s * 0.998 + cross
         calib.w = calib.w * 0.998 + 1
     end
-    return true
 end
 
 local function getCalib()
@@ -245,32 +263,33 @@ local function resolveFacing(tr, mode)
     return fx, fz, src
 end
 
-local function sourceMode(v)
-    if v == 2 or v == "Raw look direction" then return 2 end
-    if v == 3 or v == "Movement direction" then return 3 end
-    return 1
-end
-
 ---------------------------------------------------------------------
--- CFrame builder (position + facing), with fallbacks
+-- CFrame builder (remembers which method works, so it only probes once)
 ---------------------------------------------------------------------
+local cfMethods = {
+    function(gx, gy, gz, fx, fz) return CFrame.new(Vector3.new(gx, gy, gz), Vector3.new(gx + fx, gy, gz + fz)) end,
+    function(gx, gy, gz, fx, fz) return CFrame.lookAt(Vector3.new(gx, gy, gz), Vector3.new(gx + fx, gy, gz + fz)) end,
+    function(gx, gy, gz, fx, fz) return CFrame.new(gx, gy, gz, -fz, 0, -fx, 0, 1, 0, fx, 0, -fz) end,
+    function(gx, gy, gz) return CFrame.new(gx, gy, gz) end,
+}
+local cfMethod = nil
 local warnedPosOnly = false
+
 local function buildCFrame(gx, gy, gz, fx, fz)
-    local pos = Vector3.new(gx, gy, gz)
-    local lookAt = Vector3.new(gx + fx, gy, gz + fz)
-    local ok, cf = pcall(function() return CFrame.new(pos, lookAt) end)
-    if ok and cf then return cf end
-    ok, cf = pcall(function() return CFrame.lookAt(pos, lookAt) end)
-    if ok and cf then return cf end
-    ok, cf = pcall(function() return CFrame.new(gx, gy, gz, -fz, 0, -fx, 0, 1, 0, fx, 0, -fz) end)
-    if ok and cf then return cf end
-    ok, cf = pcall(function() return CFrame.new(gx, gy, gz) end)
-    if ok and cf then
-        if not warnedPosOnly then
-            warnedPosOnly = true
-            warn("[Cling] orientation CFrame not supported, moving position only")
+    if cfMethod then
+        local ok, cf = pcall(cfMethods[cfMethod], gx, gy, gz, fx, fz)
+        if ok and cf then return cf end
+    end
+    for i, fn in ipairs(cfMethods) do
+        local ok, cf = pcall(fn, gx, gy, gz, fx, fz)
+        if ok and cf then
+            cfMethod = i
+            if i == #cfMethods and not warnedPosOnly then
+                warnedPosOnly = true
+                warn("[Cling] orientation CFrame not supported, moving position only")
+            end
+            return cf
         end
-        return cf
     end
     return nil
 end
@@ -281,10 +300,14 @@ end
 local locked = false
 local target = nil
 local saved = nil
+local myRootC, tRootC = nil, nil   -- cached root parts for the fast path
+local goalCF = nil
 local writeChecks, writeFails = 0, 0
+local writeEverOK = false
 local tTracker = newTracker()
 local lpTracker = newTracker()
 local lastDebug = 0
+local dbgSrc, dbgFx, dbgFz = "-", 0, 0
 
 local function lockMovement(hum)
     saved = { hum = hum, ws = nil, jp = nil, jh = nil }
@@ -308,9 +331,9 @@ end
 
 local function unlock(reason)
     if locked then
-        restoreMovement()
         locked = false
-        target = nil
+        restoreMovement()
+        target, myRootC, tRootC = nil, nil, nil
         tTracker = newTracker()
         lpTracker = newTracker()
         if reason then notify(reason, "Cling", 2.5) end
@@ -326,8 +349,11 @@ UI.AddTab("Cling", function(tab)
     sec:Toggle("cling_enabled", "Enabled", false)
     sec:Text("Hotkey: Ctrl + U (aim cursor at a player first)")
     sec:Toggle("cling_ctrl", "Require Ctrl + U (prevents chat triggers)", true)
-    sec:SliderFloat("cling_offset", "Distance behind", 0.5, 6, 1.5, "%.1f")
+    sec:SliderFloat("cling_offset", "Distance behind", 0.2, 6, 1.0, "%.1f")
     sec:SliderFloat("cling_height", "Height offset", -2, 4, 0, "%.1f")
+    sec:SliderInt("cling_lead", "Prediction lead (ms)", 0, 250, 40)
+    sec:Toggle("cling_ping", "Add ping to lead", false)
+    sec:Tip("Lead places you where they WILL be. Raise it if you trail them while they run.")
     sec:Combo("cling_source", "Facing source", {"Auto (calibrated)", "Raw look direction", "Movement direction"}, 1)
     sec:SliderInt("cling_angle", "Facing correction (deg)", -180, 180, 0)
     sec:Tip("Only if you're still off: try 90, -90 or 180. Applies to both your position and your facing.")
@@ -386,17 +412,120 @@ task.spawn(function()
 end)
 
 ---------------------------------------------------------------------
--- Main loop (every frame)
+-- FAST PATH: one CFrame read + one CFrame write per update
+---------------------------------------------------------------------
+local function readTarget()
+    local c = tRootC.CFrame
+    local p = c.Position
+    local lv = c.LookVector
+    return p.X, p.Y, p.Z, lv.X, lv.Z
+end
+
+local function writeGoal()
+    myRootC.CFrame = goalCF
+end
+
+local lastStep = 0
+local function followStep()
+    if not locked or not tRootC or not myRootC then return end
+    local now = tick()
+    if now - lastStep < 0.002 then return end
+    lastStep = now
+
+    local ok, px, py, pz, lx, lz = pcall(readTarget)
+    if not ok or not isNum(px) or not isNum(py) or not isNum(pz) then return end -- slow loop revalidates
+
+    if isNum(lx) and isNum(lz) then
+        local l = math.sqrt(lx * lx + lz * lz)
+        if l > 0.05 then lx, lz = lx / l, lz / l else lx, lz = nil, nil end
+    else
+        lx, lz = nil, nil
+    end
+
+    updateTracker(tTracker, px, pz, lx, lz, now)
+
+    local fx, fz, src = resolveFacing(tTracker, S.mode)
+    if S.corr ~= 0 then fx, fz = rot(fx, fz, math.rad(S.corr)) end
+    dbgSrc, dbgFx, dbgFz = src, fx, fz
+
+    -- lead the target's movement so you land where they will be
+    local lead = S.leadMs / 1000
+    if S.usePing then lead = lead + S.ping / 1000 end
+    local ox, oz = 0, 0
+    local sp = tTracker.speed
+    if lead > 0 and sp > 2 and sp < 60 then
+        ox, oz = tTracker.vx * lead, tTracker.vz * lead
+        local m = math.sqrt(ox * ox + oz * oz)
+        if m > 5 then ox, oz = ox * 5 / m, oz * 5 / m end
+    end
+
+    local gx = px + ox - fx * S.back
+    local gy = py + S.up
+    local gz = pz + oz - fz * S.back
+
+    local goal = buildCFrame(gx, gy, gz, fx, fz)
+    if not goal then return end
+    goalCF = goal
+
+    local okW, err = pcall(writeGoal)
+    if not okW then
+        if not writeEverOK then
+            warn("[Cling] CFrame write failed: " .. tostring(err))
+            unlock("CFrame writes aren't supported here, see console")
+        end
+        return -- otherwise a stale part after respawn; slow loop will refresh it
+    end
+    writeEverOK = true
+
+    if writeChecks < 8 then
+        writeChecks = writeChecks + 1
+        local rok, cur = pcall(function() return myRootC.Position end)
+        if rok and cur then
+            local d = dist3(cur, Vector3.new(gx, gy, gz))
+            if d and d > 8 then writeFails = writeFails + 1 end
+        end
+        if writeChecks == 8 and writeFails == 8 then
+            unlock("Write had no effect (position unchanged). Needs memory offsets.")
+        end
+    end
+end
+
+-- driver 1: plain loop (known to work)
+task.spawn(function()
+    while alive() do
+        followStep()
+        task.wait()
+    end
+end)
+
+-- driver 2: RenderStepped, if Matcha lets us connect (extra update source)
+do
+    local conn
+    local ok = pcall(function()
+        local rs = game:GetService("RunService")
+        conn = rs.RenderStepped:Connect(function()
+            if not alive() then
+                if conn then pcall(function() conn:Disconnect() end) end
+                return
+            end
+            followStep()
+        end)
+    end)
+    if not ok then print("[Cling] RenderStepped unavailable, using loop only") end
+end
+
+---------------------------------------------------------------------
+-- SLOW LOOP (~30 Hz): enable/disable, target pick, validity, calibration
 ---------------------------------------------------------------------
 task.spawn(function()
     while alive() do
         if not ensurePlayers() then
             reportWaiting()
-            -- release the movement lock if the wait drags on
             if locked and waitStart and (tick() - waitStart) > 5 then unlock() end
             task.wait(0.5)
         else
             clearWaiting()
+            refreshSettings()
             local now = tick()
             local enabled = UI.GetValue("cling_enabled")
 
@@ -407,14 +536,16 @@ task.spawn(function()
                 else
                     local _, _, hasMouse = getCursor()
                     local p = pickUnderCursor(UI.GetValue("cling_radius"))
-                    if not p then
+                    local pRoot = p and getChar(p)
+                    if not p or not pRoot then
                         unlock(hasMouse and "No player under cursor" or "No player near screen center (cursor read unavailable)")
                     else
                         target = p
-                        locked = true
+                        myRootC, tRootC = myRoot, pRoot
                         writeChecks, writeFails = 0, 0
                         tTracker = newTracker()
                         lockMovement(myHum)
+                        locked = true
                         notify("Clinging to " .. p.Name, "Cling", 2)
                     end
                 end
@@ -430,62 +561,38 @@ task.spawn(function()
                 elseif not tRoot then
                     unlock("Target died or left, cling stopped")
                 else
-                    local back = UI.GetValue("cling_offset")
-                    local up = UI.GetValue("cling_height")
-                    local corr = UI.GetValue("cling_angle")
-                    if not isNum(back) then back = 1.5 end
-                    if not isNum(up) then up = 0 end
-                    if not isNum(corr) then corr = 0 end
-                    local mode = sourceMode(UI.GetValue("cling_source"))
+                    myRootC, tRootC = myRoot, tRoot -- refresh after respawns
 
-                    local okT = updateTracker(tTracker, tRoot, now)
-                    local okP, tPos = pcall(function() return tRoot.Position end)
-                    if okT and okP and tPos and isNum(tPos.X) then
-                        local fx, fz, src = resolveFacing(tTracker, mode)
-                        if corr ~= 0 then fx, fz = rot(fx, fz, math.rad(corr)) end
-
-                        local gx = tPos.X - fx * back
-                        local gy = tPos.Y + up
-                        local gz = tPos.Z - fz * back
-
-                        local goal = buildCFrame(gx, gy, gz, fx, fz)
-                        if goal then
-                            local ok, err = pcall(function() myRoot.CFrame = goal end)
-                            if not ok then
-                                warn("[Cling] CFrame write failed: " .. tostring(err))
-                                unlock("CFrame writes aren't supported here, see console")
-                            elseif writeChecks < 8 then
-                                writeChecks = writeChecks + 1
-                                local rok, cur = pcall(function() return myRoot.Position end)
-                                if rok and cur then
-                                    local d = dist3(cur, Vector3.new(gx, gy, gz))
-                                    if d and d > 8 then writeFails = writeFails + 1 end
-                                end
-                                if writeChecks == 8 and writeFails == 8 then
-                                    unlock("Write had no effect (position unchanged). Needs memory offsets.")
-                                end
-                            end
-                        else
-                            warn("[Cling] could not build goal CFrame")
-                        end
-
-                        if UI.GetValue("cling_debug") and (now - lastDebug) > 1 then
-                            lastDebug = now
-                            local cok, th, R = getCalib()
-                            print(string.format("[Cling] src=%s face=(%.2f,%.2f) calibOK=%s theta=%d conf=%.2f samples=%.0f moving=%s",
-                                src, fx, fz, tostring(cok), math.floor(math.deg(th) + 0.5), R, calib.w, tostring(tTracker.moving)))
-                        end
+                    if UI.GetValue("cling_debug") and (now - lastDebug) > 1 then
+                        lastDebug = now
+                        local cok, th, R = getCalib()
+                        print(string.format("[Cling] src=%s face=(%.2f,%.2f) calibOK=%s theta=%d conf=%.2f samples=%.0f speed=%.1f",
+                            dbgSrc, dbgFx, dbgFz, tostring(cok), math.floor(math.deg(th) + 0.5), R, calib.w, tTracker.speed))
                     end
                 end
             else
+                -- idle: learn the rotation error from your own walking
                 local myRoot = getChar(LP)
-                if myRoot then updateTracker(lpTracker, myRoot, now) else lpTracker = newTracker() end
+                if myRoot then
+                    local ok, c = pcall(function() return myRoot.CFrame end)
+                    if ok and c then
+                        local okp, p, lv = pcall(function() return c.Position, c.LookVector end)
+                        if okp and p and lv and isNum(p.X) and isNum(lv.X) and isNum(lv.Z) then
+                            local l = math.sqrt(lv.X * lv.X + lv.Z * lv.Z)
+                            if l > 0.05 then
+                                updateTracker(lpTracker, p.X, p.Z, lv.X / l, lv.Z / l, now)
+                            end
+                        end
+                    end
+                else
+                    lpTracker = newTracker()
+                end
             end
 
-            task.wait()
+            task.wait(0.03)
         end
     end
     restoreMovement()
 end)
 
-notify("Cling v3.1 loaded. Walk around a bit, aim at a player, press Ctrl+U.", "Cling", 4)
+notify("Cling v3.2 loaded. Walk around a bit, aim at a player, press Ctrl+U.", "Cling", 4)
