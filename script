@@ -1,8 +1,9 @@
--- Cling To Back v2.4 (Matcha) - cursor-targeted teleport + lock, chat-safe hotkey
+-- Cling To Back v2.5 (Matcha) - cursor-targeted teleport + lock, chat-safe hotkey
 -- Toggle: Left Ctrl + U (or the checkbox in the "Cling" tab)
+-- Unload: _G.__Cling3 = nil
 
 _G.__ClingLoaded = nil
-_G.__Cling2 = nil -- stops/clears any older version
+_G.__Cling2 = nil
 if _G.__Cling3 then
     notify("Cling is already running", "Cling", 3)
     return
@@ -16,7 +17,6 @@ local function getService(name)
     return nil
 end
 
--- Wait for the game to be ready (up to ~10 seconds)
 local Players
 for _ = 1, 100 do
     Players = getService("Players")
@@ -152,6 +152,7 @@ UI.AddTab("Cling", function(tab)
     sec:Toggle("cling_enabled", "Enabled", false)
     sec:Text("Hotkey: Ctrl + U (aim cursor at a player first)")
     sec:Toggle("cling_ctrl", "Require Ctrl + U (prevents chat triggers)", true)
+    sec:Toggle("cling_face", "Face their back (look at target)", true)
     sec:SliderFloat("cling_offset", "Distance behind", 0.5, 6, 1.5, "%.1f")
     sec:SliderFloat("cling_height", "Height offset", -2, 4, 0, "%.1f")
     sec:SliderInt("cling_angle", "Behind angle (deg)", -180, 180, 0)
@@ -161,7 +162,7 @@ UI.AddTab("Cling", function(tab)
     sec:Toggle("cling_debug", "Debug print (console)", false)
 end)
 
--- Hotkey (edge-detected, chat-safe)
+-- Hotkey (edge-detected, chat-safe, checked every frame)
 local VK_ENTER, VK_ESC, VK_SLASH, VK_LCTRL = 0x0D, 0x1B, 0xBF, 0xA2
 local chatOpen = false
 local enterWas, escWas, slashWas = false, false, false
@@ -200,7 +201,7 @@ task.spawn(function()
             UI.SetValue("cling_enabled", not UI.GetValue("cling_enabled"))
         end
         wasDown = down
-        task.wait(0.05)
+        task.wait() -- every frame, no fixed delay
     end
 end)
 
@@ -231,7 +232,7 @@ local function getFacing(tRoot, useMovement)
     return lastFx, lastFz
 end
 
--- Main loop
+-- Main loop (runs every frame)
 task.spawn(function()
     while _G.__Cling3 do
         local enabled = UI.GetValue("cling_enabled")
@@ -274,6 +275,8 @@ task.spawn(function()
                 if not isNum(up) then up = 0 end
                 if not isNum(angle) then angle = 0 end
                 local useMovement = (src == 2 or src == "Movement direction")
+                local faceTarget = UI.GetValue("cling_face")
+                if faceTarget == nil then faceTarget = true end
 
                 local okP, tPos = pcall(function() return tRoot.Position end)
                 if okP and tPos and isNum(tPos.X) then
@@ -291,6 +294,10 @@ task.spawn(function()
                     local goalPos = Vector3.new(gx, gy, gz)
 
                     local okC, goal = pcall(function()
+                        if faceTarget then
+                            -- front of your body points at the target's position (flat, no tilt)
+                            return CFrame.new(goalPos, Vector3.new(tPos.X, gy, tPos.Z))
+                        end
                         return CFrame.new(goalPos, Vector3.new(gx + fx, gy, gz + fz))
                     end)
                     if not okC or not goal then
@@ -331,4 +338,4 @@ task.spawn(function()
     restoreMovement()
 end)
 
-notify("Cling v2.4 loaded. Aim at a player, press Ctrl+U.", "Cling", 3)
+notify("Cling v2.5 loaded. Aim at a player, press Ctrl+U.", "Cling", 3)
