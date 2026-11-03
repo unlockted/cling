@@ -1,4 +1,4 @@
--- Cling To Back v3.0 (Matcha) - cursor-targeted teleport + lock, auto-calibrated facing
+-- Cling To Back v3.1 (Matcha) - cursor-targeted teleport + lock, auto-calibrated facing
 -- Toggle: Left Ctrl + U (or the checkbox in the "Cling" tab)
 -- Unload: _G.__ClingSession = nil
 -- Re-running replaces any previous copy automatically.
@@ -14,9 +14,11 @@ local function isNum(x) return type(x) == "number" end
 local atan2 = math.atan2 or function(y, x) return math.atan(y, x) end
 
 ---------------------------------------------------------------------
--- Robust Players / LocalPlayer lookup (never exits, re-resolves)
+-- Robust Players / LocalPlayer lookup (cached, with grace period)
 ---------------------------------------------------------------------
 local Players, LP
+local lastGood = 0
+local GRACE = 10 -- seconds to keep using cached refs when lookups fail
 
 local lookups = {
     function() return game:GetService("Players") end,
@@ -29,39 +31,59 @@ local function resolvePlayers()
     local log = {}
     for i, fn in ipairs(lookups) do
         local ok, v = pcall(fn)
-        if ok and v then return v, i, "" end
+        if ok and v then return v, "" end
         log[#log + 1] = "m" .. i .. "=" .. (ok and "nil" or tostring(v))
     end
-    return nil, nil, table.concat(log, " | ")
+    return nil, table.concat(log, " | ")
 end
 
 local function ensurePlayers()
-    if Players then
-        local ok, lp = pcall(function() return Players.LocalPlayer end)
-        if ok and lp then
-            LP = lp
+    -- 1) cached refs still readable? great, nothing else to do
+    if Players and LP then
+        local ok, name = pcall(function() return LP.Name end)
+        if ok and name then
+            lastGood = tick()
             return true
         end
-        Players, LP = nil, nil
     end
+
+    -- 2) try to re-resolve
     local svc = resolvePlayers()
     if svc then
         local ok, lp = pcall(function() return svc.LocalPlayer end)
         if ok and lp then
             Players, LP = svc, lp
+            lastGood = tick()
             return true
         end
+    end
+
+    -- 3) grace period: keep using the last good refs for a while
+    if Players and LP and (tick() - lastGood) < GRACE then
+        return true
     end
     return false
 end
 
+local waitStart = nil
 local lastWaitReport = 0
+local notifiedWaiting = false
 local function reportWaiting()
-    if tick() - lastWaitReport < 5 then return end
-    lastWaitReport = tick()
-    local _, _, log = resolvePlayers()
+    local now = tick()
+    if not waitStart then waitStart = now end
+    if now - lastWaitReport < 5 then return end
+    lastWaitReport = now
+    local _, log = resolvePlayers()
     print("[Cling] waiting for Players/LocalPlayer. " .. (log ~= "" and log or "Players found, LocalPlayer not ready"))
-    notify("Waiting for game to load...", "Cling", 2)
+    if not notifiedWaiting then
+        notifiedWaiting = true
+        notify("Waiting for game to load...", "Cling", 2)
+    end
+end
+
+local function clearWaiting()
+    waitStart = nil
+    notifiedWaiting = false
 end
 
 local function getUIS()
@@ -141,8 +163,6 @@ end
 ---------------------------------------------------------------------
 -- Rotation tracking + auto-calibration
 ---------------------------------------------------------------------
--- Shared calibration: how far Matcha's raw LookVector is rotated from the
--- direction a character actually walks. Learned from movement.
 local calib = { c = 0, s = 0, w = 0 }
 
 local function newTracker()
@@ -176,7 +196,6 @@ local function updateTracker(tr, root, now)
         if l > 0.05 then tr.lx, tr.lz = lv.X / l, lv.Z / l end
     end
 
-    -- learn the rotation error while the character is walking
     if tr.moving and tr.lx then
         local dot = tr.lx * tr.mx + tr.lz * tr.mz
         local cross = tr.lx * tr.mz - tr.lz * tr.mx
@@ -187,7 +206,6 @@ local function updateTracker(tr, root, now)
     return true
 end
 
--- returns ok, theta(radians), confidence
 local function getCalib()
     if calib.w < 25 then return false, 0, 0 end
     local R = math.sqrt(calib.c * calib.c + calib.s * calib.s) / calib.w
@@ -200,7 +218,6 @@ end
 
 local lastFx, lastFz = 0, -1
 
--- Decide which way the target is facing. Returns fx, fz, sourceLabel
 local function resolveFacing(tr, mode)
     local calibOK, theta = getCalib()
     local fx, fz, src
@@ -245,7 +262,6 @@ local function buildCFrame(gx, gy, gz, fx, fz)
     if ok and cf then return cf end
     ok, cf = pcall(function() return CFrame.lookAt(pos, lookAt) end)
     if ok and cf then return cf end
-    -- explicit yaw rotation matrix (row-major)
     ok, cf = pcall(function() return CFrame.new(gx, gy, gz, -fz, 0, -fx, 0, 1, 0, fx, 0, -fz) end)
     if ok and cf then return cf end
     ok, cf = pcall(function() return CFrame.new(gx, gy, gz) end)
@@ -375,10 +391,12 @@ end)
 task.spawn(function()
     while alive() do
         if not ensurePlayers() then
-            if locked then unlock() end
             reportWaiting()
+            -- release the movement lock if the wait drags on
+            if locked and waitStart and (tick() - waitStart) > 5 then unlock() end
             task.wait(0.5)
         else
+            clearWaiting()
             local now = tick()
             local enabled = UI.GetValue("cling_enabled")
 
@@ -426,7 +444,6 @@ task.spawn(function()
                         local fx, fz, src = resolveFacing(tTracker, mode)
                         if corr ~= 0 then fx, fz = rot(fx, fz, math.rad(corr)) end
 
-                        -- directly behind them, facing the same way (my front -> their back)
                         local gx = tPos.X - fx * back
                         local gy = tPos.Y + up
                         local gz = tPos.Z - fz * back
@@ -461,7 +478,6 @@ task.spawn(function()
                     end
                 end
             else
-                -- idle: learn the rotation error from your own walking
                 local myRoot = getChar(LP)
                 if myRoot then updateTracker(lpTracker, myRoot, now) else lpTracker = newTracker() end
             end
@@ -472,4 +488,4 @@ task.spawn(function()
     restoreMovement()
 end)
 
-notify("Cling v3.0 loaded. Walk around a bit, aim at a player, press Ctrl+U.", "Cling", 4)
+notify("Cling v3.1 loaded. Walk around a bit, aim at a player, press Ctrl+U.", "Cling", 4)
